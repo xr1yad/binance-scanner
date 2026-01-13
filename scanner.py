@@ -9,7 +9,7 @@ import pandas as pd
 # Settings (from env)
 # =========================
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")   # examples: 15m, 1h, 4h, 1d
-TOP_N = int(os.getenv("TOP_N", "80"))
+TOP_N = int(os.getenv("TOP_N", "60"))
 USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"
 
 SMA_LEN = int(os.getenv("SMA_LEN", "200"))
@@ -18,20 +18,18 @@ MACD_FAST = int(os.getenv("MACD_FAST", "12"))
 MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
 MACD_SIG  = int(os.getenv("MACD_SIG", "9"))
 
-ENABLE_SELL = os.getenv("ENABLE_SELL", "false").lower() == "true"
-ENABLE_EXIT = os.getenv("ENABLE_EXIT", "true").lower() == "true"
-ENABLE_EXIT_MACD_WEAK = os.getenv("ENABLE_EXIT_MACD_WEAK", "true").lower() == "true"
-HIST_WEAK_BARS = int(os.getenv("HIST_WEAK_BARS", "2"))
-ENABLE_EXIT_STRUCT = os.getenv("ENABLE_EXIT_STRUCT", "true").lower() == "true"
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
 # يرسل فقط إذا كانت الشمعة "أغلقت للتو" (لتجنب تكرار التنبيهات مع GitHub Actions)
 RECENT_WINDOW_SEC = int(os.getenv("RECENT_WINDOW_SEC", "240"))  # 4 دقائق افتراضي
 
+# Pump / Volume spike settings
+VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))                 # متوسط الفوليوم
+VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.5"))      # كم مرة أعلى من المتوسط
+
 # =========================
-# OKX hosts (نجرّب أكثر من واحد)
+# OKX hosts
 # =========================
 OKX_HOSTS = [
     "https://www.okx.com",
@@ -39,7 +37,6 @@ OKX_HOSTS = [
     "https://app.okx.com",
 ]
 
-# تحويل TIMEFRAME إلى bar في OKX
 OKX_BAR_MAP = {
     "1m": "1m",
     "3m": "3m",
@@ -56,7 +53,6 @@ OKX_BAR_MAP = {
     "1M": "1M",
 }
 
-# Headers لتقليل مشاكل الحماية/WAF
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -81,9 +77,6 @@ def tg_send(text: str):
 # HTTP helper (multi-host)
 # =========================
 def http_get_json_multi_host(path: str, params: dict):
-    """
-    Try multiple OKX hosts until one returns JSON with HTTP 200.
-    """
     last_err = None
     for base in OKX_HOSTS:
         url = f"{base}{path}"
@@ -92,10 +85,7 @@ def http_get_json_multi_host(path: str, params: dict):
             r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=30)
 
             ct = (r.headers.get("content-type") or "").lower()
-            if r.status_code != 200:
-                last_err = (base, r.status_code, r.text[:300])
-                continue
-            if "text/html" in ct:
+            if r.status_code != 200 or "text/html" in ct:
                 last_err = (base, r.status_code, r.text[:300])
                 continue
 
@@ -118,11 +108,6 @@ def http_get_json_multi_host(path: str, params: dict):
 # OKX functions
 # =========================
 def get_top_usdt_symbols(top_n: int):
-    """
-    OKX: GET /api/v5/market/tickers?instType=SPOT
-    - symbols are instId like BTC-USDT
-    - use volCcy24h (quote volume) to rank
-    """
     host, status, data = http_get_json_multi_host("/api/v5/market/tickers", {"instType": "SPOT"})
     if not isinstance(data, dict) or data.get("code") != "0":
         raise RuntimeError(f"OKX tickers error. Host={host} Status={status} Data={str(data)[:300]}")
@@ -160,7 +145,6 @@ def _infer_close_time(open_time: pd.Timestamp, bar: str) -> pd.Timestamp:
         if bar.endswith("W"):
             return open_time + pd.to_timedelta(int(bar[:-1]), unit="w")
         if bar.endswith("M"):
-            # شهر: نخليه نفس open_time (تقريب بسيط)
             return open_time
     except Exception:
         pass
@@ -184,7 +168,6 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     if not isinstance(rows, list) or not rows:
         raise RuntimeError(f"OKX candles empty {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    # OKX returns arrays like: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
     parsed = []
     for r in rows:
         if not isinstance(r, list) or len(r) < 6:
@@ -202,10 +185,11 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna().sort_values("start_ms").reset_index(drop=True)
-    df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms")
+
+    # tz-naive
+    df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms", utc=True).dt.tz_convert(None)
     df["close_time"] = df["open_time"].apply(lambda t: _infer_close_time(t, bar))
 
-    # مهم: نرجع confirm عشان نختار شمعة مغلقة فقط
     cols = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
     if "confirm" in df.columns:
         cols.append("confirm")
@@ -306,73 +290,55 @@ def evaluate_signals(df: pd.DataFrame):
     df["smcBearEvent"] = (pd.Series(bosBear) | pd.Series(chochBear))
 
     if USE_SWEEP:
-        df["buySignal"]  = df["trendBull"] & df["macdBull"] & df["smcBullEvent"] & pd.Series(sweepBull)
-        df["sellSignal"] = df["trendBear"] & df["macdBear"] & df["smcBearEvent"] & pd.Series(sweepBear)
+        df["buySignal"] = df["trendBull"] & df["macdBull"] & df["smcBullEvent"] & pd.Series(sweepBull)
     else:
-        df["buySignal"]  = df["trendBull"] & df["macdBull"] & df["smcBullEvent"]
-        df["sellSignal"] = df["trendBear"] & df["macdBear"] & df["smcBearEvent"]
+        df["buySignal"] = df["trendBull"] & df["macdBull"] & df["smcBullEvent"]
 
     df["buyTrigger"] = df["buySignal"] & (~df["buySignal"].shift(1).fillna(False))
-    df["sellTrigger"] = df["sellSignal"] & (~df["sellSignal"].shift(1).fillna(False))
 
-    df["histWeak"] = False
-    for i in range(HIST_WEAK_BARS, len(df)):
-        ok = True
-        for k in range(HIST_WEAK_BARS):
-            if not (df.at[i - k, "hist"] < df.at[i - k - 1, "hist"]):
-                ok = False
-                break
-        df.at[i, "histWeak"] = ok
+    # ===== Volume spike (Pump potential) =====
+    # نسبة الفوليوم الحالي إلى متوسط آخر VOL_MA_LEN شمعة
+    df["volMA"] = df["volume"].rolling(VOL_MA_LEN).mean()
+    df["volRatio"] = df["volume"] / df["volMA"]
 
-    if ENABLE_EXIT_MACD_WEAK:
-        df["exitMacdWeak"] = df["trendBull"] & df["histWeak"]
-    else:
-        df["exitMacdWeak"] = False
-
-    last_low_series = []
-    last_low = math.nan
-    for i in range(len(df)):
-        if not math.isnan(df.at[i, "pl"]):
-            last_low = float(df.at[i, "pl"])
-        last_low_series.append(last_low)
-    df["lastSwingLow"] = last_low_series
-
-    if ENABLE_EXIT_STRUCT:
-        df["exitStructure"] = (~pd.isna(df["lastSwingLow"])) & (df["close"] < df["lastSwingLow"])
-    else:
-        df["exitStructure"] = False
-
-    df["exitLongSignal"] = df["exitMacdWeak"] | df["exitStructure"]
-    df["exitLongTrigger"] = df["exitLongSignal"] & (~df["exitLongSignal"].shift(1).fillna(False))
-
-    # =========================
-    # اختيار آخر شمعة "مؤكدة" + منع تكرار التنبيه
-    # =========================
+    # ===== Choose last confirmed candle =====
     if "confirm" in df.columns:
         confirmed_idx = df.index[df["confirm"].astype(str) == "1"]
         if len(confirmed_idx) == 0:
             return None
         idx = int(confirmed_idx[-1])
     else:
-        # fallback (إذا API ما رجّع confirm)
         idx = len(df) - 2
         if idx < 0:
             return None
 
-    now = pd.Timestamp.utcnow()
+    # ===== Recent-close filter (no duplicates) =====
+    now = pd.Timestamp.utcnow().tz_localize(None)
     ct = pd.to_datetime(df.at[idx, "close_time"], errors="coerce")
     if pd.isna(ct):
         return None
-    age_sec = (now - ct).total_seconds()
-    if age_sec < 0:
-        age_sec = abs(age_sec)
+    ct = pd.Timestamp(ct).tz_localize(None)
 
+    age_sec = abs((now - ct).total_seconds())
     is_recent_close = age_sec <= RECENT_WINDOW_SEC
 
+    buy_now = bool(df.at[idx, "buyTrigger"]) and is_recent_close
+
+    # Pump potential if buy + big volume spike
+    vol_ratio = df.at[idx, "volRatio"]
+    try:
+        vol_ratio_f = float(vol_ratio)
+    except Exception:
+        vol_ratio_f = float("nan")
+
+    pump = False
+    if buy_now and (not math.isnan(vol_ratio_f)) and vol_ratio_f >= VOL_SPIKE_MULT:
+        pump = True
+
     return {
-        "buy": bool(df.at[idx, "buyTrigger"]) and is_recent_close,
-        "sell": bool(df.at[idx, "sellTrigger"]) and is_recent_close,
-        "exit": bool(df.at[idx, "exitLongTrigger"]) and is_recent_close,
+        "buy": buy_now,
+        "pump": pump,
+        "vol_ratio": vol_ratio_f,
         "price": float(df.at[idx, "close"]),
         "time": str(df.at[idx, "close_time"]),
     }
@@ -388,7 +354,7 @@ def main():
 
     alerts = []
     print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (OKX) ...")
-    print(f"Recent-window (sec): {RECENT_WINDOW_SEC}")
+    print(f"Recent-window (sec): {RECENT_WINDOW_SEC} | VOL_MA_LEN={VOL_MA_LEN} | VOL_SPIKE_MULT={VOL_SPIKE_MULT}")
 
     for sym in symbols:
         try:
@@ -397,12 +363,17 @@ def main():
             if not sig:
                 continue
 
+            # ✅ BUY ONLY
             if sig["buy"]:
-                alerts.append(f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}")
-            if ENABLE_SELL and sig["sell"]:
-                alerts.append(f"🔴 SELL | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}")
-            if ENABLE_EXIT and sig["exit"]:
-                alerts.append(f"🟡 EXIT | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}")
+                if sig["pump"]:
+                    alerts.append(
+                        f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}\n"
+                        f"🚀 PUMP محتمل | Volume Spike x{sig['vol_ratio']:.2f} (>= {VOL_SPIKE_MULT})"
+                    )
+                else:
+                    alerts.append(
+                        f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}"
+                    )
 
         except Exception as e:
             print(f"{sym} error: {e}")
@@ -410,11 +381,12 @@ def main():
         time.sleep(0.25)
 
     if alerts:
-        msg = f"📡 Scanner Alerts (OKX) | TF {TIMEFRAME}\n" + "\n".join(alerts[:30])
+        msg = f"📡 BUY Alerts Only (OKX) | TF {TIMEFRAME}\n" + "\n\n".join(alerts[:20])
         tg_send(msg)
-        print("Sent:", len(alerts))
+        print("Sent BUY alerts:", len(alerts))
     else:
         print("No alerts.")
 
 if __name__ == "__main__":
     main()
+
