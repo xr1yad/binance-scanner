@@ -2,7 +2,7 @@ name: Binance Scanner (1H)
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "5 * * * *"
   workflow_dispatch:
 
 jobs:
