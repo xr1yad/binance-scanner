@@ -9,7 +9,7 @@ import pandas as pd
 # Settings (from env)
 # =========================
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")   # examples: 15m, 1h, 4h, 1d
-TOP_N = int(os.getenv("TOP_N", "60"))
+TOP_N = int(os.getenv("TOP_N", "80"))
 USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"
 
 SMA_LEN = int(os.getenv("SMA_LEN", "200"))
