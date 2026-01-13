@@ -32,6 +32,7 @@ BINANCE_BASE = "https://api.binance.com"
 # =========================
 # Telegram
 # =========================
+send_telegram("🟢 Scanner is running successfully")
 def tg_send(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         print("Missing BOT_TOKEN / CHAT_ID")
