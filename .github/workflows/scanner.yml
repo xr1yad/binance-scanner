@@ -33,7 +33,7 @@ jobs:
   MACD_FAST: "12"
   MACD_SLOW: "26"
   MACD_SIG: "9"
-  ENABLE_SELL: "true"
+  ENABLE_SELL: "false"
   ENABLE_EXIT: "true"
   ENABLE_EXIT_MACD_WEAK: "true"
   HIST_WEAK_BARS: "2"
