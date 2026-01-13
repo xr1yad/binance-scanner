@@ -1,15 +1,16 @@
 import os
 import time
 import math
+import random
 import requests
 import pandas as pd
 
 # =========================
 # Settings (from env)
 # =========================
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")      # 1h
-TOP_N = int(os.getenv("TOP_N", "60"))         # عدد العملات
-USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"  # حسب إعداداتك
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+TOP_N = int(os.getenv("TOP_N", "60"))
+USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"
 
 SMA_LEN = int(os.getenv("SMA_LEN", "200"))
 PIVOT_LEN = int(os.getenv("PIVOT_LEN", "3"))
@@ -26,9 +27,12 @@ ENABLE_EXIT_STRUCT = os.getenv("ENABLE_EXIT_STRUCT", "true").lower() == "true"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-BYBIT_BASE = "https://api.bybit.com"
+# Bybit hosts (نجرّب أكثر من واحد)
+BYBIT_HOSTS = [
+    "https://api.bybit.com",
+    "https://api.bytick.com",   # بديل أحيانًا يشتغل إذا الرئيسي مقفل
+]
 
-# Bybit interval mapping (minutes)
 BYBIT_INTERVAL_MAP = {
     "1m": "1",
     "3m": "3",
@@ -45,6 +49,15 @@ BYBIT_INTERVAL_MAP = {
     "1M": "M",
 }
 
+# Headers لتجاوز بعض WAF
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
 # =========================
 # Telegram
 # =========================
@@ -58,32 +71,61 @@ def tg_send(text: str):
     r.raise_for_status()
 
 # =========================
-# Bybit helpers
+# HTTP helper (multi-host)
 # =========================
-def bybit_get(path: str, params: dict):
-    url = f"{BYBIT_BASE}{path}"
-    r = requests.get(url, params=params, timeout=30)
-    try:
-        data = r.json()
-    except Exception:
-        raise RuntimeError(f"Bybit response not JSON. Status={r.status_code} Body={r.text[:300]}")
-    return r.status_code, data
+def http_get_json_multi_host(path: str, params: dict):
+    """
+    Try multiple Bybit hosts until one returns JSON with HTTP 200.
+    If all fail, return the last (status, text) for debugging.
+    """
+    last_err = None
+    for base in BYBIT_HOSTS:
+        url = f"{base}{path}"
+        try:
+            # jitter صغير
+            time.sleep(0.05 + random.random() * 0.05)
+            r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=30)
 
+            # إذا مو 200 أو رجع HTML
+            ct = (r.headers.get("content-type") or "").lower()
+            if r.status_code != 200:
+                last_err = (base, r.status_code, r.text[:300])
+                continue
+            if "text/html" in ct:
+                last_err = (base, r.status_code, r.text[:300])
+                continue
+
+            # حاول JSON
+            try:
+                data = r.json()
+            except Exception:
+                last_err = (base, r.status_code, r.text[:300])
+                continue
+
+            return base, r.status_code, data
+
+        except Exception as e:
+            last_err = (base, -1, str(e)[:300])
+            continue
+
+    # كلهم فشلوا
+    base, status, body = last_err if last_err else ("", -1, "unknown")
+    raise RuntimeError(f"All Bybit hosts failed. LastHost={base} Status={status} Body={body}")
+
+# =========================
+# Bybit functions
+# =========================
 def get_top_usdt_symbols(top_n: int):
     """
-    Bybit V5 tickers:
-    GET /v5/market/tickers?category=spot
-    Response: retCode=0, result.list = [{symbol, turnover24h, volume24h, ...}, ...]
+    /v5/market/tickers?category=spot
     """
-    status, data = bybit_get("/v5/market/tickers", {"category": "spot"})
-
+    host, status, data = http_get_json_multi_host("/v5/market/tickers", {"category": "spot"})
     if not isinstance(data, dict) or data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit tickers error. Status={status} Data={str(data)[:300]}")
+        raise RuntimeError(f"Bybit tickers error. Host={host} Status={status} Data={str(data)[:300]}")
 
-    result = data.get("result", {})
-    items = result.get("list", [])
-    if not isinstance(items, list) or len(items) == 0:
-        raise RuntimeError(f"Bybit tickers empty/invalid. Status={status} Data={str(data)[:300]}")
+    items = (data.get("result") or {}).get("list", [])
+    if not isinstance(items, list) or not items:
+        raise RuntimeError(f"Bybit tickers empty. Host={host} Status={status} Data={str(data)[:300]}")
 
     rows = []
     for x in items:
@@ -92,30 +134,23 @@ def get_top_usdt_symbols(top_n: int):
         sym = x.get("symbol", "")
         if not sym.endswith("USDT"):
             continue
-
-        # نرتب حسب turnover24h (أفضل من volume فقط لأنه يعكس القيمة بالدولار)
-        t = x.get("turnover24h", "0")
         try:
-            turnover = float(t)
+            turnover = float(x.get("turnover24h", "0"))
         except Exception:
             turnover = 0.0
-
         rows.append((sym, turnover))
 
     rows.sort(key=lambda z: z[1], reverse=True)
-    return [s for s, _ in rows[:top_n]]
+    syms = [s for s, _ in rows[:top_n]]
+    print(f"Tickers OK from host: {host}. Symbols: {len(syms)}")
+    return syms
 
 def fetch_klines(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
-    """
-    Bybit V5 kline:
-    GET /v5/market/kline?category=spot&symbol=BTCUSDT&interval=60&limit=500
-    Response: result.list = [[startTime, open, high, low, close, volume, turnover], ...]
-    """
-    interval = BYBIT_INTERVAL_MAP.get(timeframe, None)
+    interval = BYBIT_INTERVAL_MAP.get(timeframe)
     if interval is None:
-        raise ValueError(f"Unsupported TIMEFRAME for Bybit: {timeframe}. Use one of: {list(BYBIT_INTERVAL_MAP.keys())}")
+        raise ValueError(f"Unsupported TIMEFRAME: {timeframe}")
 
-    status, data = bybit_get("/v5/market/kline", {
+    host, status, data = http_get_json_multi_host("/v5/market/kline", {
         "category": "spot",
         "symbol": symbol,
         "interval": interval,
@@ -123,15 +158,13 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
     })
 
     if not isinstance(data, dict) or data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit kline error for {symbol}. Status={status} Data={str(data)[:300]}")
+        raise RuntimeError(f"Bybit kline error {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    result = data.get("result", {})
-    rows = result.get("list", [])
-    if not isinstance(rows, list) or len(rows) == 0:
-        raise RuntimeError(f"Bybit kline empty/invalid for {symbol}. Status={status} Data={str(data)[:300]}")
+    rows = (data.get("result") or {}).get("list", [])
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"Bybit kline empty {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    # Bybit غالبًا يرجع أحدث شموع أولاً → نرتب تصاعدي
-    # row: [startTime, open, high, low, close, volume, turnover]
+    # rows newest-first -> sort ascending by startTime
     parsed = []
     for r in rows:
         if not isinstance(r, list) or len(r) < 6:
@@ -144,10 +177,8 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna().sort_values("start_ms").reset_index(drop=True)
-
     df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms")
-    # close_time تقريبًا = open_time + مدة الشمعة
-    # لو D/W/M نخليه نفس open_time للعرض فقط
+
     if interval.isdigit():
         minutes = int(interval)
         df["close_time"] = df["open_time"] + pd.to_timedelta(minutes, unit="m")
@@ -157,7 +188,7 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
     return df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
 
 # =========================
-# Indicators
+# Indicators / Strategy
 # =========================
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -170,7 +201,7 @@ def macd(close: pd.Series, fast: int, slow: int, sig: int):
 
 def compute_pivots(df: pd.DataFrame, n: int):
     highs = df["high"].values
-    lows  = df["low"].values
+    lows = df["low"].values
     ph = [math.nan] * len(df)
     pl = [math.nan] * len(df)
 
@@ -181,12 +212,8 @@ def compute_pivots(df: pd.DataFrame, n: int):
             ph[i] = highs[i]
         if lows[i] == min(window_l):
             pl[i] = lows[i]
-
     return pd.Series(ph), pd.Series(pl)
 
-# =========================
-# Strategy logic
-# =========================
 def evaluate_signals(df: pd.DataFrame):
     if len(df) < max(SMA_LEN + 10, 300):
         return None
@@ -210,7 +237,7 @@ def evaluate_signals(df: pd.DataFrame):
     df["pl"] = pl
 
     lastSwingHigh = math.nan
-    lastSwingLow  = math.nan
+    lastSwingLow = math.nan
     structureTrend = 0
 
     bosBull = [False] * len(df)
@@ -226,15 +253,15 @@ def evaluate_signals(df: pd.DataFrame):
         if not math.isnan(df.at[i, "pl"]):
             lastSwingLow = float(df.at[i, "pl"])
 
-        c  = float(df.at[i, "close"])
+        c = float(df.at[i, "close"])
         lo = float(df.at[i, "low"])
         hi = float(df.at[i, "high"])
 
         bBull = (not math.isnan(lastSwingHigh)) and (c > lastSwingHigh)
-        bBear = (not math.isnan(lastSwingLow))  and (c < lastSwingLow)
+        bBear = (not math.isnan(lastSwingLow)) and (c < lastSwingLow)
 
         cBull = (structureTrend == -1) and bBull
-        cBear = (structureTrend ==  1) and bBear
+        cBear = (structureTrend == 1) and bBear
 
         bosBull[i] = bBull
         bosBear[i] = bBear
@@ -261,10 +288,9 @@ def evaluate_signals(df: pd.DataFrame):
         df["buySignal"]  = df["trendBull"] & df["macdBull"] & df["smcBullEvent"]
         df["sellSignal"] = df["trendBear"] & df["macdBear"] & df["smcBearEvent"]
 
-    df["buyTrigger"]  = df["buySignal"]  & (~df["buySignal"].shift(1).fillna(False))
+    df["buyTrigger"] = df["buySignal"] & (~df["buySignal"].shift(1).fillna(False))
     df["sellTrigger"] = df["sellSignal"] & (~df["sellSignal"].shift(1).fillna(False))
 
-    # EXIT: MACD histogram weakening
     df["histWeak"] = False
     for i in range(HIST_WEAK_BARS, len(df)):
         ok = True
@@ -279,14 +305,12 @@ def evaluate_signals(df: pd.DataFrame):
     else:
         df["exitMacdWeak"] = False
 
-    # EXIT: break last swing low
     last_low_series = []
     last_low = math.nan
     for i in range(len(df)):
         if not math.isnan(df.at[i, "pl"]):
             last_low = float(df.at[i, "pl"])
         last_low_series.append(last_low)
-
     df["lastSwingLow"] = last_low_series
 
     if ENABLE_EXIT_STRUCT:
@@ -297,26 +321,29 @@ def evaluate_signals(df: pd.DataFrame):
     df["exitLongSignal"] = df["exitMacdWeak"] | df["exitStructure"]
     df["exitLongTrigger"] = df["exitLongSignal"] & (~df["exitLongSignal"].shift(1).fillna(False))
 
-    # Use last CLOSED candle
     idx = len(df) - 2
     if idx < 0:
         return None
 
     return {
-        "buy":  bool(df.at[idx, "buyTrigger"]),
+        "buy": bool(df.at[idx, "buyTrigger"]),
         "sell": bool(df.at[idx, "sellTrigger"]),
         "exit": bool(df.at[idx, "exitLongTrigger"]),
         "price": float(df.at[idx, "close"]),
         "time": str(df.at[idx, "close_time"]),
     }
 
-# =========================
-# Main
-# =========================
 def main():
-    symbols = get_top_usdt_symbols(TOP_N)
-    alerts = []
+    try:
+        symbols = get_top_usdt_symbols(TOP_N)
+    except Exception as e:
+        # لا نوقف البوت: نرسل لك سبب المشكلة
+        err = f"❌ Bybit API blocked from runner.\n{e}"
+        print(err)
+        tg_send(err)
+        return
 
+    alerts = []
     print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (Bybit) ...")
 
     for sym in symbols:
@@ -336,8 +363,7 @@ def main():
         except Exception as e:
             print(f"{sym} error: {e}")
 
-        # خفف الضغط على API
-        time.sleep(0.2)
+        time.sleep(0.25)
 
     if alerts:
         msg = "📡 1H Scanner Alerts (Bybit)\n" + "\n".join(alerts[:30])
@@ -348,5 +374,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
