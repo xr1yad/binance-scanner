@@ -22,20 +22,19 @@ jobs:
 
       - name: Run scanner
         env:
-  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-  CHAT_ID: ${{ secrets.CHAT_ID }}
-
-  TIMEFRAME: "1h"
-  TOP_N: "80"
-  USE_SWEEP: "false"      # ✅ مثل صورتك (غير مفعّل)
-  SMA_LEN: "200"
-  PIVOT_LEN: "3"
-  MACD_FAST: "12"
-  MACD_SLOW: "26"
-  MACD_SIG: "9"
-  ENABLE_SELL: "false"
-  ENABLE_EXIT: "true"
-  ENABLE_EXIT_MACD_WEAK: "true"
-  HIST_WEAK_BARS: "2"
-  ENABLE_EXIT_STRUCT: "true"
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TIMEFRAME: "1h"
+          TOP_N: "80"
+          USE_SWEEP: "false"
+          SMA_LEN: "200"
+          PIVOT_LEN: "3"
+          MACD_FAST: "12"
+          MACD_SLOW: "26"
+          MACD_SIG: "9"
+          ENABLE_SELL: "false"
+          ENABLE_EXIT: "true"
+          ENABLE_EXIT_MACD_WEAK: "true"
+          HIST_WEAK_BARS: "2"
+          ENABLE_EXIT_STRUCT: "true"
         run: python scanner.py
