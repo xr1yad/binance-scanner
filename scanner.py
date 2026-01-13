@@ -8,7 +8,7 @@ import pandas as pd
 # =========================
 # Settings (from env)
 # =========================
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")   # examples: 15m, 1h, 4h, 1d
 TOP_N = int(os.getenv("TOP_N", "60"))
 USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"
 
@@ -27,29 +27,34 @@ ENABLE_EXIT_STRUCT = os.getenv("ENABLE_EXIT_STRUCT", "true").lower() == "true"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-# Bybit hosts (نجرّب أكثر من واحد)
-BYBIT_HOSTS = [
-    "https://api.bybit.com",
-    "https://api.bytick.com",   # بديل أحيانًا يشتغل إذا الرئيسي مقفل
+# =========================
+# OKX hosts (نجرّب أكثر من واحد)
+# =========================
+OKX_HOSTS = [
+    "https://www.okx.com",
+    "https://my.okx.com",
+    "https://app.okx.com",
 ]
 
-BYBIT_INTERVAL_MAP = {
-    "1m": "1",
-    "3m": "3",
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "2h": "120",
-    "4h": "240",
-    "6h": "360",
-    "12h": "720",
-    "1d": "D",
-    "1w": "W",
-    "1M": "M",
+# تحويل TIMEFRAME (ستايلك) إلى bar في OKX
+# OKX bar examples: 1m/3m/5m/15m/30m/1H/2H/4H/6H/12H/1D/1W/1M  :contentReference[oaicite:3]{index=3}
+OKX_BAR_MAP = {
+    "1m": "1m",
+    "3m": "3m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1H",
+    "2h": "2H",
+    "4h": "4H",
+    "6h": "6H",
+    "12h": "12H",
+    "1d": "1D",
+    "1w": "1W",
+    "1M": "1M",
 }
 
-# Headers لتجاوز بعض WAF
+# Headers لتقليل مشاكل الحماية/WAF
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -75,18 +80,15 @@ def tg_send(text: str):
 # =========================
 def http_get_json_multi_host(path: str, params: dict):
     """
-    Try multiple Bybit hosts until one returns JSON with HTTP 200.
-    If all fail, return the last (status, text) for debugging.
+    Try multiple OKX hosts until one returns JSON with HTTP 200.
     """
     last_err = None
-    for base in BYBIT_HOSTS:
+    for base in OKX_HOSTS:
         url = f"{base}{path}"
         try:
-            # jitter صغير
             time.sleep(0.05 + random.random() * 0.05)
             r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=30)
 
-            # إذا مو 200 أو رجع HTML
             ct = (r.headers.get("content-type") or "").lower()
             if r.status_code != 200:
                 last_err = (base, r.status_code, r.text[:300])
@@ -95,7 +97,6 @@ def http_get_json_multi_host(path: str, params: dict):
                 last_err = (base, r.status_code, r.text[:300])
                 continue
 
-            # حاول JSON
             try:
                 data = r.json()
             except Exception:
@@ -108,82 +109,101 @@ def http_get_json_multi_host(path: str, params: dict):
             last_err = (base, -1, str(e)[:300])
             continue
 
-    # كلهم فشلوا
     base, status, body = last_err if last_err else ("", -1, "unknown")
-    raise RuntimeError(f"All Bybit hosts failed. LastHost={base} Status={status} Body={body}")
+    raise RuntimeError(f"All OKX hosts failed. LastHost={base} Status={status} Body={body}")
 
 # =========================
-# Bybit functions
+# OKX functions
 # =========================
 def get_top_usdt_symbols(top_n: int):
     """
-    /v5/market/tickers?category=spot
+    OKX: GET /api/v5/market/tickers?instType=SPOT
+    - symbols are instId like BTC-USDT
+    - use volCcy24h (quote volume) to rank :contentReference[oaicite:4]{index=4}
     """
-    host, status, data = http_get_json_multi_host("/v5/market/tickers", {"category": "spot"})
-    if not isinstance(data, dict) or data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit tickers error. Host={host} Status={status} Data={str(data)[:300]}")
+    host, status, data = http_get_json_multi_host("/api/v5/market/tickers", {"instType": "SPOT"})
+    if not isinstance(data, dict) or data.get("code") != "0":
+        raise RuntimeError(f"OKX tickers error. Host={host} Status={status} Data={str(data)[:300]}")
 
-    items = (data.get("result") or {}).get("list", [])
+    items = data.get("data", [])
     if not isinstance(items, list) or not items:
-        raise RuntimeError(f"Bybit tickers empty. Host={host} Status={status} Data={str(data)[:300]}")
+        raise RuntimeError(f"OKX tickers empty. Host={host} Status={status} Data={str(data)[:300]}")
 
     rows = []
     for x in items:
         if not isinstance(x, dict):
             continue
-        sym = x.get("symbol", "")
-        if not sym.endswith("USDT"):
+        inst = x.get("instId", "")
+        if not inst.endswith("-USDT"):
             continue
         try:
-            turnover = float(x.get("turnover24h", "0"))
+            # volCcy24h = quote volume for SPOT :contentReference[oaicite:5]{index=5}
+            turnover = float(x.get("volCcy24h", "0"))
         except Exception:
             turnover = 0.0
-        rows.append((sym, turnover))
+        rows.append((inst, turnover))
 
     rows.sort(key=lambda z: z[1], reverse=True)
     syms = [s for s, _ in rows[:top_n]]
     print(f"Tickers OK from host: {host}. Symbols: {len(syms)}")
     return syms
 
-def fetch_klines(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
-    interval = BYBIT_INTERVAL_MAP.get(timeframe)
-    if interval is None:
-        raise ValueError(f"Unsupported TIMEFRAME: {timeframe}")
+def _infer_close_time(open_time: pd.Timestamp, bar: str) -> pd.Timestamp:
+    # bar examples: 15m, 1H, 4H, 1D, 1W, 1M  :contentReference[oaicite:6]{index=6}
+    try:
+        if bar.endswith("m"):
+            return open_time + pd.to_timedelta(int(bar[:-1]), unit="m")
+        if bar.endswith("H"):
+            return open_time + pd.to_timedelta(int(bar[:-1]), unit="h")
+        if bar.endswith("D"):
+            return open_time + pd.to_timedelta(int(bar[:-1]), unit="d")
+        if bar.endswith("W"):
+            return open_time + pd.to_timedelta(int(bar[:-1]), unit="w")
+        if bar.endswith("M"):
+            # شهر تقريبًا: نستخدم MonthBegin/MonthEnd معقدة؛ نخليها open_time كحل بسيط
+            return open_time
+    except Exception:
+        pass
+    return open_time
 
-    host, status, data = http_get_json_multi_host("/v5/market/kline", {
-        "category": "spot",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": str(limit),
+def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+    bar = OKX_BAR_MAP.get(timeframe)
+    if bar is None:
+        raise ValueError(f"Unsupported TIMEFRAME: {timeframe}. Supported: {list(OKX_BAR_MAP.keys())}")
+
+    host, status, data = http_get_json_multi_host("/api/v5/market/candles", {
+        "instId": symbol,
+        "bar": bar,
+        "limit": str(min(int(limit), 300)),  # OKX max 300 :contentReference[oaicite:7]{index=7}
     })
 
-    if not isinstance(data, dict) or data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit kline error {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
+    if not isinstance(data, dict) or data.get("code") != "0":
+        raise RuntimeError(f"OKX candles error {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    rows = (data.get("result") or {}).get("list", [])
+    rows = data.get("data", [])
     if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"Bybit kline empty {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
+        raise RuntimeError(f"OKX candles empty {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    # rows newest-first -> sort ascending by startTime
+    # OKX returns arrays like: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm] :contentReference[oaicite:8]{index=8}
     parsed = []
     for r in rows:
         if not isinstance(r, list) or len(r) < 6:
             continue
         parsed.append(r)
 
-    df = pd.DataFrame(parsed, columns=["start_ms", "open", "high", "low", "close", "volume", "turnover"])
+    df = pd.DataFrame(parsed, columns=[
+        "start_ms", "open", "high", "low", "close", "volume",
+        "volCcy", "volCcyQuote", "confirm"
+    ][:len(parsed[0])])
+
     df["start_ms"] = pd.to_numeric(df["start_ms"], errors="coerce")
     for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna().sort_values("start_ms").reset_index(drop=True)
     df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms")
-
-    if interval.isdigit():
-        minutes = int(interval)
-        df["close_time"] = df["open_time"] + pd.to_timedelta(minutes, unit="m")
-    else:
-        df["close_time"] = df["open_time"]
+    df["close_time"] = df["open_time"].apply(lambda t: _infer_close_time(t, bar))
 
     return df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
 
@@ -337,18 +357,17 @@ def main():
     try:
         symbols = get_top_usdt_symbols(TOP_N)
     except Exception as e:
-        # لا نوقف البوت: نرسل لك سبب المشكلة
-        err = f"❌ Bybit API blocked from runner.\n{e}"
+        err = f"❌ OKX API blocked from runner.\n{e}"
         print(err)
         tg_send(err)
         return
 
     alerts = []
-    print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (Bybit) ...")
+    print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (OKX) ...")
 
     for sym in symbols:
         try:
-            df = fetch_klines(sym, TIMEFRAME, limit=500)
+            df = fetch_klines(sym, TIMEFRAME, limit=300)
             sig = evaluate_signals(df)
             if not sig:
                 continue
@@ -366,7 +385,7 @@ def main():
         time.sleep(0.25)
 
     if alerts:
-        msg = "📡 1H Scanner Alerts (Bybit)\n" + "\n".join(alerts[:30])
+        msg = f"📡 Scanner Alerts (OKX) | TF {TIMEFRAME}\n" + "\n".join(alerts[:30])
         tg_send(msg)
         print("Sent:", len(alerts))
     else:
