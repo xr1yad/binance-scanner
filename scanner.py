@@ -27,6 +27,9 @@ ENABLE_EXIT_STRUCT = os.getenv("ENABLE_EXIT_STRUCT", "true").lower() == "true"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
+# يرسل فقط إذا كانت الشمعة "أغلقت للتو" (لتجنب تكرار التنبيهات مع GitHub Actions)
+RECENT_WINDOW_SEC = int(os.getenv("RECENT_WINDOW_SEC", "240"))  # 4 دقائق افتراضي
+
 # =========================
 # OKX hosts (نجرّب أكثر من واحد)
 # =========================
@@ -36,8 +39,7 @@ OKX_HOSTS = [
     "https://app.okx.com",
 ]
 
-# تحويل TIMEFRAME (ستايلك) إلى bar في OKX
-# OKX bar examples: 1m/3m/5m/15m/30m/1H/2H/4H/6H/12H/1D/1W/1M  :contentReference[oaicite:3]{index=3}
+# تحويل TIMEFRAME إلى bar في OKX
 OKX_BAR_MAP = {
     "1m": "1m",
     "3m": "3m",
@@ -119,7 +121,7 @@ def get_top_usdt_symbols(top_n: int):
     """
     OKX: GET /api/v5/market/tickers?instType=SPOT
     - symbols are instId like BTC-USDT
-    - use volCcy24h (quote volume) to rank :contentReference[oaicite:4]{index=4}
+    - use volCcy24h (quote volume) to rank
     """
     host, status, data = http_get_json_multi_host("/api/v5/market/tickers", {"instType": "SPOT"})
     if not isinstance(data, dict) or data.get("code") != "0":
@@ -137,7 +139,6 @@ def get_top_usdt_symbols(top_n: int):
         if not inst.endswith("-USDT"):
             continue
         try:
-            # volCcy24h = quote volume for SPOT :contentReference[oaicite:5]{index=5}
             turnover = float(x.get("volCcy24h", "0"))
         except Exception:
             turnover = 0.0
@@ -149,7 +150,6 @@ def get_top_usdt_symbols(top_n: int):
     return syms
 
 def _infer_close_time(open_time: pd.Timestamp, bar: str) -> pd.Timestamp:
-    # bar examples: 15m, 1H, 4H, 1D, 1W, 1M  :contentReference[oaicite:6]{index=6}
     try:
         if bar.endswith("m"):
             return open_time + pd.to_timedelta(int(bar[:-1]), unit="m")
@@ -160,7 +160,7 @@ def _infer_close_time(open_time: pd.Timestamp, bar: str) -> pd.Timestamp:
         if bar.endswith("W"):
             return open_time + pd.to_timedelta(int(bar[:-1]), unit="w")
         if bar.endswith("M"):
-            # شهر تقريبًا: نستخدم MonthBegin/MonthEnd معقدة؛ نخليها open_time كحل بسيط
+            # شهر: نخليه نفس open_time (تقريب بسيط)
             return open_time
     except Exception:
         pass
@@ -174,7 +174,7 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     host, status, data = http_get_json_multi_host("/api/v5/market/candles", {
         "instId": symbol,
         "bar": bar,
-        "limit": str(min(int(limit), 300)),  # OKX max 300 :contentReference[oaicite:7]{index=7}
+        "limit": str(min(int(limit), 300)),
     })
 
     if not isinstance(data, dict) or data.get("code") != "0":
@@ -184,7 +184,7 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     if not isinstance(rows, list) or not rows:
         raise RuntimeError(f"OKX candles empty {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    # OKX returns arrays like: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm] :contentReference[oaicite:8]{index=8}
+    # OKX returns arrays like: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
     parsed = []
     for r in rows:
         if not isinstance(r, list) or len(r) < 6:
@@ -205,7 +205,11 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms")
     df["close_time"] = df["open_time"].apply(lambda t: _infer_close_time(t, bar))
 
-    return df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
+    # مهم: نرجع confirm عشان نختار شمعة مغلقة فقط
+    cols = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
+    if "confirm" in df.columns:
+        cols.append("confirm")
+    return df[cols]
 
 # =========================
 # Indicators / Strategy
@@ -341,14 +345,34 @@ def evaluate_signals(df: pd.DataFrame):
     df["exitLongSignal"] = df["exitMacdWeak"] | df["exitStructure"]
     df["exitLongTrigger"] = df["exitLongSignal"] & (~df["exitLongSignal"].shift(1).fillna(False))
 
-    idx = len(df) - 2
-    if idx < 0:
+    # =========================
+    # اختيار آخر شمعة "مؤكدة" + منع تكرار التنبيه
+    # =========================
+    if "confirm" in df.columns:
+        confirmed_idx = df.index[df["confirm"].astype(str) == "1"]
+        if len(confirmed_idx) == 0:
+            return None
+        idx = int(confirmed_idx[-1])
+    else:
+        # fallback (إذا API ما رجّع confirm)
+        idx = len(df) - 2
+        if idx < 0:
+            return None
+
+    now = pd.Timestamp.utcnow()
+    ct = pd.to_datetime(df.at[idx, "close_time"], errors="coerce")
+    if pd.isna(ct):
         return None
+    age_sec = (now - ct).total_seconds()
+    if age_sec < 0:
+        age_sec = abs(age_sec)
+
+    is_recent_close = age_sec <= RECENT_WINDOW_SEC
 
     return {
-        "buy": bool(df.at[idx, "buyTrigger"]),
-        "sell": bool(df.at[idx, "sellTrigger"]),
-        "exit": bool(df.at[idx, "exitLongTrigger"]),
+        "buy": bool(df.at[idx, "buyTrigger"]) and is_recent_close,
+        "sell": bool(df.at[idx, "sellTrigger"]) and is_recent_close,
+        "exit": bool(df.at[idx, "exitLongTrigger"]) and is_recent_close,
         "price": float(df.at[idx, "close"]),
         "time": str(df.at[idx, "close_time"]),
     }
@@ -364,6 +388,7 @@ def main():
 
     alerts = []
     print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (OKX) ...")
+    print(f"Recent-window (sec): {RECENT_WINDOW_SEC}")
 
     for sym in symbols:
         try:
