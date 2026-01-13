@@ -1,8 +1,8 @@
-name: Binance Scanner (1H)
+name: OKX Scanner (15m)
 
 on:
   schedule:
-    - cron: "5 * * * *"
+    - cron: "*/5 * * * *"   # كل 5 دقائق
   workflow_dispatch:
 
 jobs:
@@ -24,17 +24,23 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          TIMEFRAME: "1h"
+
+          TIMEFRAME: "15m"
           TOP_N: "80"
           USE_SWEEP: "false"
+
           SMA_LEN: "200"
           PIVOT_LEN: "3"
           MACD_FAST: "12"
           MACD_SLOW: "26"
           MACD_SIG: "9"
+
           ENABLE_SELL: "false"
           ENABLE_EXIT: "true"
           ENABLE_EXIT_MACD_WEAK: "true"
           HIST_WEAK_BARS: "2"
           ENABLE_EXIT_STRUCT: "true"
+
+          # مهم لمنع التكرار (يرسل فقط إذا الشمعة أغلقت خلال آخر X ثانية)
+          RECENT_WINDOW_SEC: "240"   # 4 دقائق
         run: python scanner.py
