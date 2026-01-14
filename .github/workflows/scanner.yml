@@ -35,9 +35,9 @@ jobs:
 
           SMA_LEN: "200"
           PIVOT_LEN: "3"
-          MACD_FAST: "12"
-          MACD_SLOW: "26"
-          MACD_SIG: "9"
+          MACD_FAST: "5"
+          MACD_SLOW: "13"
+          MACD_SIG: "3"
 
           VOL_MA_LEN: "20"
           VOL_SPIKE_MULT: "2.5"
