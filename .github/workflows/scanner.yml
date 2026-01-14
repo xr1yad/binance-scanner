@@ -2,7 +2,7 @@ name: OKX Scanner (15m)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # كل 5 دقائق
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -25,7 +25,11 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
 
-          TIMEFRAME: "15m"
+          TIMEFRAME: "15m"          # الإشارة على 15m
+          MONITOR_TF: "1m"          # المراقبة على 1m
+          SCAN_EVERY_MIN: "5"       # يطابق cron
+          EARLY_LOOKBACK_MIN: "5"   # نقارن الآن vs قبل 5 دقائق
+
           TOP_N: "80"
           USE_SWEEP: "false"
 
@@ -35,12 +39,6 @@ jobs:
           MACD_SLOW: "26"
           MACD_SIG: "9"
 
-          ENABLE_SELL: "false"
-          ENABLE_EXIT: "true"
-          ENABLE_EXIT_MACD_WEAK: "true"
-          HIST_WEAK_BARS: "2"
-          ENABLE_EXIT_STRUCT: "true"
-
-          # مهم لمنع التكرار (يرسل فقط إذا الشمعة أغلقت خلال آخر X ثانية)
-          RECENT_WINDOW_SEC: "240"   # 4 دقائق
+          VOL_MA_LEN: "20"
+          VOL_SPIKE_MULT: "2.5"
         run: python scanner.py
