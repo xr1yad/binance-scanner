@@ -8,7 +8,10 @@ import pandas as pd
 # =========================
 # Settings (from env)
 # =========================
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")   # examples: 15m, 1h, 4h, 1d
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")        # HTF signal timeframe (15m)
+MONITOR_TF = os.getenv("MONITOR_TF", "1m")       # LTF used for early detection (1m)
+SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "5"))  # matches cron */5
+
 TOP_N = int(os.getenv("TOP_N", "60"))
 USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"
 
@@ -21,12 +24,12 @@ MACD_SIG  = int(os.getenv("MACD_SIG", "9"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-# يرسل فقط إذا كانت الشمعة "أغلقت للتو" (لتجنب تكرار التنبيهات مع GitHub Actions)
-RECENT_WINDOW_SEC = int(os.getenv("RECENT_WINDOW_SEC", "240"))  # 4 دقائق افتراضي
+# Early detection window: compare "now snapshot" vs "past snapshot"
+EARLY_LOOKBACK_MIN = int(os.getenv("EARLY_LOOKBACK_MIN", str(SCAN_EVERY_MIN)))
 
-# Pump / Volume spike settings
-VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))                 # متوسط الفوليوم
-VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.5"))      # كم مرة أعلى من المتوسط
+# Pump / Volume spike settings (on HTF candle)
+VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))
+VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.5"))
 
 # =========================
 # OKX hosts
@@ -150,7 +153,7 @@ def _infer_close_time(open_time: pd.Timestamp, bar: str) -> pd.Timestamp:
         pass
     return open_time
 
-def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+def fetch_klines(symbol: str, timeframe: str, limit: int = 600) -> pd.DataFrame:
     bar = OKX_BAR_MAP.get(timeframe)
     if bar is None:
         raise ValueError(f"Unsupported TIMEFRAME: {timeframe}. Supported: {list(OKX_BAR_MAP.keys())}")
@@ -158,7 +161,7 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     host, status, data = http_get_json_multi_host("/api/v5/market/candles", {
         "instId": symbol,
         "bar": bar,
-        "limit": str(min(int(limit), 300)),
+        "limit": str(min(int(limit), 300)),  # OKX max 300
     })
 
     if not isinstance(data, dict) or data.get("code") != "0":
@@ -186,7 +189,7 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
 
     df = df.dropna().sort_values("start_ms").reset_index(drop=True)
 
-    # tz-naive
+    # tz-naive (UTC)
     df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms", utc=True).dt.tz_convert(None)
     df["close_time"] = df["open_time"].apply(lambda t: _infer_close_time(t, bar))
 
@@ -194,6 +197,52 @@ def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     if "confirm" in df.columns:
         cols.append("confirm")
     return df[cols]
+
+# =========================
+# Build HTF candles from 1m (forming candle supported)
+# =========================
+def _floor_time(ts: pd.Timestamp, minutes: int) -> pd.Timestamp:
+    # floor to N-minute boundary (UTC naive)
+    ts = pd.Timestamp(ts).tz_localize(None)
+    minute = (ts.minute // minutes) * minutes
+    return ts.replace(minute=minute, second=0, microsecond=0)
+
+def build_htf_from_1m(df1m: pd.DataFrame, htf_minutes: int, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """
+    Build HTF candles up to cutoff time (inclusive of last available 1m <= cutoff).
+    The last HTF candle will be 'forming' based on available 1m data.
+    """
+    cutoff = pd.Timestamp(cutoff).tz_localize(None)
+
+    # keep 1m rows with open_time <= cutoff
+    d = df1m[df1m["open_time"] <= cutoff].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    d = d.sort_values("open_time").reset_index(drop=True)
+
+    # assign bucket open
+    d["bucket_open"] = d["open_time"].apply(lambda t: _floor_time(t, htf_minutes))
+
+    # aggregate OHLCV
+    g = d.groupby("bucket_open", as_index=False).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        last_1m_time=("open_time", "max"),
+    )
+
+    g = g.sort_values("bucket_open").reset_index(drop=True)
+
+    g["open_time"] = g["bucket_open"]
+    g["close_time"] = g["open_time"] + pd.to_timedelta(htf_minutes, unit="m")
+
+    # mark confirm: only candles fully closed before cutoff are confirmed
+    g["confirm"] = (g["close_time"] <= cutoff).astype(int).astype(str)
+
+    return g[["open_time", "open", "high", "low", "close", "volume", "close_time", "confirm"]]
 
 # =========================
 # Indicators / Strategy
@@ -222,10 +271,10 @@ def compute_pivots(df: pd.DataFrame, n: int):
             pl[i] = lows[i]
     return pd.Series(ph), pd.Series(pl)
 
-def evaluate_signals(df: pd.DataFrame):
-    if len(df) < max(SMA_LEN + 10, 300):
-        return None
-
+def compute_buy_signal_on_htf(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns df with buySignal computed for ALL candles (including the forming last candle).
+    """
     df = df.copy()
     df["sma200"] = df["close"].rolling(SMA_LEN).mean()
 
@@ -235,10 +284,7 @@ def evaluate_signals(df: pd.DataFrame):
     df["hist"] = hist
 
     df["macdBull"] = (df["macd"] > df["signal"]) & (df["hist"] > 0)
-    df["macdBear"] = (df["macd"] < df["signal"]) & (df["hist"] < 0)
-
     df["trendBull"] = df["close"] > df["sma200"]
-    df["trendBear"] = df["close"] < df["sma200"]
 
     ph, pl = compute_pivots(df, PIVOT_LEN)
     df["ph"] = ph
@@ -249,11 +295,8 @@ def evaluate_signals(df: pd.DataFrame):
     structureTrend = 0
 
     bosBull = [False] * len(df)
-    bosBear = [False] * len(df)
     chochBull = [False] * len(df)
-    chochBear = [False] * len(df)
     sweepBull = [False] * len(df)
-    sweepBear = [False] * len(df)
 
     for i in range(len(df)):
         if not math.isnan(df.at[i, "ph"]):
@@ -263,85 +306,97 @@ def evaluate_signals(df: pd.DataFrame):
 
         c = float(df.at[i, "close"])
         lo = float(df.at[i, "low"])
-        hi = float(df.at[i, "high"])
 
         bBull = (not math.isnan(lastSwingHigh)) and (c > lastSwingHigh)
-        bBear = (not math.isnan(lastSwingLow)) and (c < lastSwingLow)
-
         cBull = (structureTrend == -1) and bBull
-        cBear = (structureTrend == 1) and bBear
 
         bosBull[i] = bBull
-        bosBear[i] = bBear
         chochBull[i] = cBull
-        chochBear[i] = cBear
 
         if bBull:
             structureTrend = 1
-        if bBear:
-            structureTrend = -1
 
         if not math.isnan(lastSwingLow):
             sweepBull[i] = (lo < lastSwingLow) and (c > lastSwingLow)
-        if not math.isnan(lastSwingHigh):
-            sweepBear[i] = (hi > lastSwingHigh) and (c < lastSwingHigh)
 
     df["smcBullEvent"] = (pd.Series(bosBull) | pd.Series(chochBull))
-    df["smcBearEvent"] = (pd.Series(bosBear) | pd.Series(chochBear))
 
     if USE_SWEEP:
         df["buySignal"] = df["trendBull"] & df["macdBull"] & df["smcBullEvent"] & pd.Series(sweepBull)
     else:
         df["buySignal"] = df["trendBull"] & df["macdBull"] & df["smcBullEvent"]
 
-    df["buyTrigger"] = df["buySignal"] & (~df["buySignal"].shift(1).fillna(False))
-
-    # ===== Volume spike (Pump potential) =====
-    # نسبة الفوليوم الحالي إلى متوسط آخر VOL_MA_LEN شمعة
+    # volume spike on HTF
     df["volMA"] = df["volume"].rolling(VOL_MA_LEN).mean()
     df["volRatio"] = df["volume"] / df["volMA"]
 
-    # ===== Choose last confirmed candle =====
-    if "confirm" in df.columns:
-        confirmed_idx = df.index[df["confirm"].astype(str) == "1"]
-        if len(confirmed_idx) == 0:
-            return None
-        idx = int(confirmed_idx[-1])
-    else:
-        idx = len(df) - 2
-        if idx < 0:
-            return None
+    return df
 
-    # ===== Recent-close filter (no duplicates) =====
-    now = pd.Timestamp.utcnow().tz_localize(None)
-    ct = pd.to_datetime(df.at[idx, "close_time"], errors="coerce")
-    if pd.isna(ct):
+def early_buy_trigger(df1m: pd.DataFrame, htf_minutes: int) -> dict | None:
+    """
+    Compare current snapshot vs past snapshot (EARLY_LOOKBACK_MIN).
+    Trigger when buySignal becomes True within the last lookback window.
+    """
+    if df1m is None or df1m.empty:
         return None
-    ct = pd.Timestamp(ct).tz_localize(None)
 
-    age_sec = abs((now - ct).total_seconds())
-    is_recent_close = age_sec <= RECENT_WINDOW_SEC
+    df1m = df1m.sort_values("open_time").reset_index(drop=True)
+    latest = pd.Timestamp(df1m["open_time"].iloc[-1]).tz_localize(None)
 
-    buy_now = bool(df.at[idx, "buyTrigger"]) and is_recent_close
+    now_cutoff = latest
+    past_cutoff = latest - pd.to_timedelta(max(1, EARLY_LOOKBACK_MIN), unit="m")
 
-    # Pump potential if buy + big volume spike
-    vol_ratio = df.at[idx, "volRatio"]
-    try:
-        vol_ratio_f = float(vol_ratio)
-    except Exception:
-        vol_ratio_f = float("nan")
+    htf_now = build_htf_from_1m(df1m, htf_minutes, now_cutoff)
+    htf_past = build_htf_from_1m(df1m, htf_minutes, past_cutoff)
 
-    pump = False
-    if buy_now and (not math.isnan(vol_ratio_f)) and vol_ratio_f >= VOL_SPIKE_MULT:
-        pump = True
+    # need enough data for sma/macd/pivots
+    min_need = max(SMA_LEN + 10, 250)
+    if len(htf_now) < min_need or len(htf_past) < min_need:
+        return None
 
-    return {
-        "buy": buy_now,
-        "pump": pump,
-        "vol_ratio": vol_ratio_f,
-        "price": float(df.at[idx, "close"]),
-        "time": str(df.at[idx, "close_time"]),
-    }
+    htf_now = compute_buy_signal_on_htf(htf_now)
+    htf_past = compute_buy_signal_on_htf(htf_past)
+
+    now_sig = bool(htf_now["buySignal"].iloc[-1])
+    past_sig = bool(htf_past["buySignal"].iloc[-1])
+
+    if (not past_sig) and now_sig:
+        # Pump?
+        vol_ratio = htf_now["volRatio"].iloc[-1]
+        try:
+            vol_ratio_f = float(vol_ratio)
+        except Exception:
+            vol_ratio_f = float("nan")
+
+        pump = False
+        if (not math.isnan(vol_ratio_f)) and vol_ratio_f >= VOL_SPIKE_MULT:
+            pump = True
+
+        last_price = float(htf_now["close"].iloc[-1])
+        bucket_open = str(htf_now["open_time"].iloc[-1])
+        bucket_close = str(htf_now["close_time"].iloc[-1])
+        live_time = str(latest)
+
+        return {
+            "buy": True,
+            "pump": pump,
+            "vol_ratio": vol_ratio_f,
+            "price": last_price,
+            "bucket_open": bucket_open,
+            "bucket_close": bucket_close,
+            "live_time": live_time,
+        }
+
+    return None
+
+def parse_htf_minutes(tf: str) -> int:
+    # supports 15m, 30m, 1h ...
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return int(tf[:-1])
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 60
+    raise ValueError(f"Unsupported TIMEFRAME for early mode: {tf}")
 
 def main():
     try:
@@ -352,14 +407,45 @@ def main():
         tg_send(err)
         return
 
+    # We use MONITOR_TF data (1m) to build TIMEFRAME candles (15m)
+    htf_minutes = parse_htf_minutes(TIMEFRAME)
+
     alerts = []
-    print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (OKX) ...")
-    print(f"Recent-window (sec): {RECENT_WINDOW_SEC} | VOL_MA_LEN={VOL_MA_LEN} | VOL_SPIKE_MULT={VOL_SPIKE_MULT}")
+    print(f"Scanning {len(symbols)} symbols | HTF={TIMEFRAME} (early) via LTF={MONITOR_TF}")
+    print(f"EARLY_LOOKBACK_MIN={EARLY_LOOKBACK_MIN} | VOL_MA_LEN={VOL_MA_LEN} | VOL_SPIKE_MULT={VOL_SPIKE_MULT}")
 
     for sym in symbols:
         try:
-            df = fetch_klines(sym, TIMEFRAME, limit=300)
-            sig = evaluate_signals(df)
+            # fetch 1m (OKX max 300 per call) – 300 minutes = 5 hours, enough for lookback but SMA200 needs more HTF candles.
+            # For SMA200 on 15m you need 200 candles => 3000 minutes => not possible in one call.
+            # So we fetch HTF directly for history, and overlay the forming candle from 1m.
+            # ---- Hybrid approach ----
+            htf_hist = fetch_klines(sym, TIMEFRAME, limit=300)   # confirmed HTF history (max OKX)
+            ltf = fetch_klines(sym, MONITOR_TF, limit=300)       # recent 1m for forming candle
+
+            if htf_hist.empty or ltf.empty:
+                continue
+
+            # Build forming HTF candles from 1m up to latest
+            latest_ltf = pd.Timestamp(ltf["open_time"].iloc[-1]).tz_localize(None)
+            htf_from_1m = build_htf_from_1m(ltf, htf_minutes, latest_ltf)
+            if htf_from_1m.empty:
+                continue
+
+            # Merge: take HTF history (confirmed) + replace/append last bucket with forming candle
+            htf_all = htf_hist.copy().sort_values("open_time").reset_index(drop=True)
+
+            forming_bucket_open = htf_from_1m["open_time"].iloc[-1]
+            forming_row = htf_from_1m.iloc[-1:].copy()
+
+            # remove any same bucket from hist then append forming
+            htf_all = htf_all[htf_all["open_time"] != forming_bucket_open]
+            htf_all = pd.concat([htf_all, forming_row], ignore_index=True).sort_values("open_time").reset_index(drop=True)
+
+            # Now we can compute early trigger by comparing snapshots:
+            # snapshot_now: using current ltf cutoff
+            # snapshot_past: using ltf cutoff - EARLY_LOOKBACK_MIN
+            sig = early_buy_trigger(ltf, htf_minutes)
             if not sig:
                 continue
 
@@ -367,12 +453,14 @@ def main():
             if sig["buy"]:
                 if sig["pump"]:
                     alerts.append(
-                        f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}\n"
+                        f"🟢 BUY EARLY | {sym} | HTF {TIMEFRAME} (forming) | Price {sig['price']:.8g}\n"
+                        f"🕒 LTF time {sig['live_time']} | HTF bucket {sig['bucket_open']} → {sig['bucket_close']}\n"
                         f"🚀 PUMP محتمل | Volume Spike x{sig['vol_ratio']:.2f} (>= {VOL_SPIKE_MULT})"
                     )
                 else:
                     alerts.append(
-                        f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}"
+                        f"🟢 BUY EARLY | {sym} | HTF {TIMEFRAME} (forming) | Price {sig['price']:.8g}\n"
+                        f"🕒 LTF time {sig['live_time']} | HTF bucket {sig['bucket_open']} → {sig['bucket_close']}"
                     )
 
         except Exception as e:
@@ -381,7 +469,7 @@ def main():
         time.sleep(0.25)
 
     if alerts:
-        msg = f"📡 BUY Alerts Only (OKX) | TF {TIMEFRAME}\n" + "\n\n".join(alerts[:20])
+        msg = f"📡 BUY Alerts (EARLY) | HTF {TIMEFRAME} via LTF {MONITOR_TF}\n" + "\n\n".join(alerts[:20])
         tg_send(msg)
         print("Sent BUY alerts:", len(alerts))
     else:
@@ -389,4 +477,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
