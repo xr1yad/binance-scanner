@@ -1,4 +1,4 @@
-name: OKX Scanner (15m)
+name: OKX Scanner (5m)
 
 on:
   schedule:
@@ -25,7 +25,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
 
-          TIMEFRAME: "15m"
+          TIMEFRAME: "5m"
           TOP_N: "80"
           USE_SWEEP: "false"
 
