@@ -1,411 +1,363 @@
 import os
+import json
 import time
 import math
-import random
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple, List
 
-import requests
+import numpy as np
 import pandas as pd
+import requests
 
-# =========================
-# Settings (from env)
-# =========================
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")  # examples: 15m, 1h, 4h, 1d
-TOP_N = int(os.getenv("TOP_N", "80"))
-USE_SWEEP = os.getenv("USE_SWEEP", "false").lower() == "true"
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
-SMA_LEN = int(os.getenv("SMA_LEN", "200"))
-PIVOT_LEN = int(os.getenv("PIVOT_LEN", "3"))
 
-MACD_FAST = int(os.getenv("MACD_FAST", "12"))
-MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
-MACD_SIG = int(os.getenv("MACD_SIG", "9"))
+# -------------------------
+# Helpers: indicators
+# -------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
+def wma(series: pd.Series, length: int) -> pd.Series:
+    if length <= 0:
+        return pd.Series(np.nan, index=series.index)
+    weights = np.arange(1, length + 1, dtype=float)
+    return series.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
 
-# يرسل فقط إذا كانت الشمعة "أغلقت للتو" (لتجنب تكرار التنبيهات مع GitHub Actions)
-RECENT_WINDOW_SEC = int(os.getenv("RECENT_WINDOW_SEC", "240"))  # 4 دقائق افتراضي
+def hma(series: pd.Series, length: int) -> pd.Series:
+    # HMA(n) = WMA( 2*WMA(price, n/2) - WMA(price, n), sqrt(n) )
+    if length <= 0:
+        return pd.Series(np.nan, index=series.index)
+    half = max(1, length // 2)
+    sqrt_n = max(1, int(math.sqrt(length)))
+    wma_full = wma(series, length)
+    wma_half = wma(series, half)
+    raw = 2 * wma_half - wma_full
+    return wma(raw, sqrt_n)
 
-# Pump / Volume spike settings
-VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))        # متوسط الفوليوم
-VOL_SPIKE_MULT = float(os.getenv("VOL_SPIKE_MULT", "2.5"))  # كم مرة أعلى من المتوسط
+def rsi(series: pd.Series, length: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
 
-# =========================
-# OKX hosts
-# =========================
-OKX_HOSTS = [
-    "https://www.okx.com",
-    "https://my.okx.com",
-    "https://app.okx.com",
-]
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-OKX_BAR_MAP = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1H",
-    "2h": "2H",
-    "4h": "4H",
-    "6h": "6H",
-    "12h": "12H",
-    "1d": "1D",
-    "1w": "1W",
-    "1M": "1M",
-}
+def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
 
-COMMON_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
+def atr_sma_tr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.rolling(length).mean()
 
-# =========================
-# Telegram
-# =========================
-def tg_send(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Missing BOT_TOKEN / CHAT_ID")
-        return
+def macd(close: pd.Series, fast: int, slow: int, signal: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    line = ema_fast - ema_slow
+    sig = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
+    return line, sig, hist
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
+
+# -------------------------
+# Pine translation core
+# -------------------------
+
+@dataclass
+class SignalResult:
+    symbol: str
+    timeframe: str
+    ts_close: int  # candle close time (ms)
+    side: str      # "BUY" or "SELL"
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    tp3: float
+
+
+def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    r = requests.get(BINANCE_KLINES, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    # Binance kline fields:
+    # 0 open time, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 close time, ...
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume","close_time",
+        "qav","num_trades","tbbav","tbqav","ignore"
+    ])
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = df["open_time"].astype(np.int64)
+    df["close_time"] = df["close_time"].astype(np.int64)
+    return df
+
+
+def compute_signals(
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str,
+    multiplier: float = 2.0,
+    atr_len: int = 14,
+    atr_method: str = "Method 1",   # "Method 1" = Wilder ATR, "Method 2" = SMA(TR)
+    stoploss_pct: float = 2.0,      # Pine stopLossVal (0 disables)
+) -> Optional[SignalResult]:
+    # Use last CLOSED candle like Pine alert.freq_once_per_bar_close
+    if len(df) < max(atr_len * 3, 60):
+        return None
+
+    o = df["open"]
+    h = df["high"]
+    l = df["low"]
+    c = df["close"]
+
+    src = (h + l) / 2.0  # hl2
+
+    # src1 = ta.hma(open, 5)[1]
+    src1 = hma(o, 5).shift(1)
+    # src2 = ta.hma(close, 12)
+    src2 = hma(c, 12)
+
+    momm1 = src1.diff()
+    momm2 = src2.diff()
+
+    # f1(m, n) => m >= n ? m : 0.0
+    # f2(m, n) => m >= n ? 0.0 : -m
+    m1 = np.where(momm1 >= momm2, momm1, 0.0)
+    m2 = np.where(momm1 >= momm2, 0.0, -momm1)
+
+    sm1 = pd.Series(m1, index=df.index).rolling(1).sum()
+    sm2 = pd.Series(m2, index=df.index).rolling(1).sum()
+
+    # percent(sm1-sm2, sm1+sm2) => 100 * nom / div
+    denom = (sm1 + sm2).replace(0, np.nan)
+    cmo_calc = 100.0 * (sm1 - sm2) / denom
+
+    # hpivot/lpivot logic (كما في كودك)
+    hh = h.rolling(2).max()
+    hh_dev = hh.rolling(2).std(ddof=0)  # ta.dev
+    hpivot = hh.where((hh_dev.fillna(0) == 0), np.nan).ffill()
+
+    ll = l.rolling(2).min()
+    ll_dev = ll.rolling(2).std(ddof=0)
+    lpivot = ll.where((ll_dev.fillna(0) == 0), np.nan).ffill()
+
+    rsi_calc = rsi(c, 9)
+
+    # sup/res موجودة بالكود لكنها غير مستخدمة في الإشارات النهائية
+    # sup = (rsi_calc < 25) & (cmo_calc > 50) & lpivot.notna()
+    # res = (rsi_calc > 75) & (cmo_calc < -50) & hpivot.notna()
+
+    # ATR
+    if atr_method == "Method 2":
+        atr_val = atr_sma_tr(h, l, c, atr_len)
+    else:
+        atr_val = atr_wilder(h, l, c, atr_len)
+
+    up = src - (multiplier * atr_val)
+    dn = src + (multiplier * atr_val)
+
+    # trailing logic:
+    up1 = up.shift(1)
+    dn1 = dn.shift(1)
+
+    up_tr = up.copy()
+    dn_tr = dn.copy()
+
+    for i in range(1, len(df)):
+        # up := close[1] > up1 ? max(up, up1) : up
+        if c.iloc[i-1] > up1.iloc[i]:
+            up_tr.iloc[i] = max(up.iloc[i], up1.iloc[i])
+        else:
+            up_tr.iloc[i] = up.iloc[i]
+
+        # dn := close[1] < dn1 ? min(dn, dn1) : dn
+        if c.iloc[i-1] < dn1.iloc[i]:
+            dn_tr.iloc[i] = min(dn.iloc[i], dn1.iloc[i])
+        else:
+            dn_tr.iloc[i] = dn.iloc[i]
+
+    # trend switching
+    trend = pd.Series(1, index=df.index, dtype=int)
+    for i in range(1, len(df)):
+        prev = trend.iloc[i-1]
+        if prev == -1 and c.iloc[i] > dn_tr.iloc[i-1]:
+            trend.iloc[i] = 1
+        elif prev == 1 and c.iloc[i] < up_tr.iloc[i-1]:
+            trend.iloc[i] = -1
+        else:
+            trend.iloc[i] = prev
+
+    buy_signal = (trend == 1) & (trend.shift(1) == -1)
+    sell_signal = (trend == -1) & (trend.shift(1) == 1)
+
+    # pos logic + SL/TP reset
+    pos = pd.Series(0.0, index=df.index)
+    for i in range(1, len(df)):
+        if buy_signal.iloc[i]:
+            pos.iloc[i] = 1
+        elif sell_signal.iloc[i]:
+            pos.iloc[i] = -1
+        else:
+            pos.iloc[i] = pos.iloc[i-1]
+
+    long_cond = buy_signal & (pos.shift(1) != 1)
+    short_cond = sell_signal & (pos.shift(1) != -1)
+
+    # valuewhen(longCond, close, 0) => last close where long_cond true
+    entry_long = c.where(long_cond).ffill()
+    entry_short = c.where(short_cond).ffill()
+
+    sl = (stoploss_pct / 100.0) if stoploss_pct > 0 else 99999.0
+
+    stop_long = entry_long * (1 - sl)
+    stop_short = entry_short * (1 + sl)
+
+    tp_long_1 = entry_long * (1 + sl)
+    tp_long_2 = entry_long * (1 + sl * 2)
+    tp_long_3 = entry_long * (1 + sl * 3)
+
+    tp_short_1 = entry_short * (1 - sl)
+    tp_short_2 = entry_short * (1 - sl * 2)
+    tp_short_3 = entry_short * (1 - sl * 3)
+
+    # Reset pos to 0 when SL/TP3 hit (كما بالكود)
+    # Note: هذا جزء "إدارة صفقة" وليس شرط الدخول نفسه،
+    # لكنه مهم عشان pos يرجع 0 لو سكربتك يعتمد عليها بعدين.
+    pos2 = pos.copy()
+    for i in range(1, len(df)):
+        prev_pos = pos2.iloc[i-1]
+
+        long_sl = (l.iloc[i] < stop_long.iloc[i]) and (prev_pos == 1)
+        short_sl = (h.iloc[i] > stop_short.iloc[i]) and (prev_pos == -1)
+
+        long_tp_final = (h.iloc[i] > tp_long_3.iloc[i]) and (prev_pos == 1)
+        short_tp_final = (l.iloc[i] < tp_short_3.iloc[i]) and (prev_pos == -1)
+
+        if long_sl or short_sl or long_tp_final or short_tp_final:
+            pos2.iloc[i] = 0.0
+        else:
+            pos2.iloc[i] = prev_pos if not (buy_signal.iloc[i] or sell_signal.iloc[i]) else pos2.iloc[i]
+
+    # نستخدم آخر شمعة مغلقة = قبل آخر صف في Binance (الأخير غالباً مغلق، لكن أضمن: نأخذ -2)
+    idx = df.index[-2]
+    close_time = int(df.loc[idx, "close_time"])
+
+    if bool(long_cond.loc[idx]):
+        e = float(entry_long.loc[idx])
+        return SignalResult(
+            symbol=symbol, timeframe=timeframe, ts_close=close_time,
+            side="BUY", entry=e,
+            sl=float(stop_long.loc[idx]),
+            tp1=float(tp_long_1.loc[idx]), tp2=float(tp_long_2.loc[idx]), tp3=float(tp_long_3.loc[idx]),
+        )
+
+    if bool(short_cond.loc[idx]):
+        e = float(entry_short.loc[idx])
+        return SignalResult(
+            symbol=symbol, timeframe=timeframe, ts_close=close_time,
+            side="SELL", entry=e,
+            sl=float(stop_short.loc[idx]),
+            tp1=float(tp_short_1.loc[idx]), tp2=float(tp_short_2.loc[idx]), tp3=float(tp_short_3.loc[idx]),
+        )
+
+    return None
+
+
+# -------------------------
+# Telegram + State
+# -------------------------
+
+def load_state(path: str = "state.json") -> Dict:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"sent": {}}
+
+def save_state(state: Dict, path: str = "state.json") -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def tg_send(bot_token: str, chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
 
-# =========================
-# HTTP helper (multi-host)
-# =========================
-def http_get_json_multi_host(path: str, params: dict):
-    last_err = None
-    for base in OKX_HOSTS:
-        url = f"{base}{path}"
-        try:
-            time.sleep(0.05 + random.random() * 0.05)
-            r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=30)
-            ct = (r.headers.get("content-type") or "").lower()
+def make_key(sig: SignalResult) -> str:
+    return f"{sig.symbol}|{sig.timeframe}|{sig.ts_close}|{sig.side}"
 
-            if r.status_code != 200 or "text/html" in ct:
-                last_err = (base, r.status_code, r.text[:300])
-                continue
-
-            try:
-                data = r.json()
-            except Exception:
-                last_err = (base, r.status_code, r.text[:300])
-                continue
-
-            return base, r.status_code, data
-
-        except Exception as e:
-            last_err = (base, -1, str(e)[:300])
-            continue
-
-    base, status, body = last_err if last_err else ("", -1, "unknown")
-    raise RuntimeError(f"All OKX hosts failed. LastHost={base} Status={status} Body={body}")
-
-# =========================
-# OKX functions
-# =========================
-def get_top_usdt_symbols(top_n: int):
-    host, status, data = http_get_json_multi_host("/api/v5/market/tickers", {"instType": "SPOT"})
-    if not isinstance(data, dict) or data.get("code") != "0":
-        raise RuntimeError(f"OKX tickers error. Host={host} Status={status} Data={str(data)[:300]}")
-
-    items = data.get("data", [])
-    if not isinstance(items, list) or not items:
-        raise RuntimeError(f"OKX tickers empty. Host={host} Status={status} Data={str(data)[:300]}")
-
-    rows = []
-    for x in items:
-        if not isinstance(x, dict):
-            continue
-        inst = x.get("instId", "")
-        if not inst.endswith("-USDT"):
-            continue
-        try:
-            turnover = float(x.get("volCcy24h", "0"))
-        except Exception:
-            turnover = 0.0
-        rows.append((inst, turnover))
-
-    rows.sort(key=lambda z: z[1], reverse=True)
-    syms = [s for s, _ in rows[:top_n]]
-    print(f"Tickers OK from host: {host}. Symbols: {len(syms)}")
-    return syms
-
-
-def _infer_close_time(open_time: pd.Timestamp, bar: str) -> pd.Timestamp:
-    try:
-        if bar.endswith("m"):
-            return open_time + pd.to_timedelta(int(bar[:-1]), unit="m")
-        if bar.endswith("H"):
-            return open_time + pd.to_timedelta(int(bar[:-1]), unit="h")
-        if bar.endswith("D"):
-            return open_time + pd.to_timedelta(int(bar[:-1]), unit="d")
-        if bar.endswith("W"):
-            return open_time + pd.to_timedelta(int(bar[:-1]), unit="w")
-        if bar.endswith("M"):
-            return open_time
-    except Exception:
-        pass
-    return open_time
-
-
-def fetch_klines(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    bar = OKX_BAR_MAP.get(timeframe)
-    if bar is None:
-        raise ValueError(f"Unsupported TIMEFRAME: {timeframe}. Supported: {list(OKX_BAR_MAP.keys())}")
-
-    host, status, data = http_get_json_multi_host(
-        "/api/v5/market/candles",
-        {"instId": symbol, "bar": bar, "limit": str(min(int(limit), 300))},
+def format_message(sig: SignalResult) -> str:
+    # قريب من نص تنبيهاتك في Pine
+    return (
+        f"{sig.symbol} {sig.side} ALERT!\n"
+        f"TF: {sig.timeframe}\n"
+        f"Entry: {sig.entry:.8f}\n"
+        f"TP1: {sig.tp1:.8f}\n"
+        f"TP2: {sig.tp2:.8f}\n"
+        f"TP3: {sig.tp3:.8f}\n"
+        f"SL : {sig.sl:.8f}\n"
+        f"Candle close (ms): {sig.ts_close}"
     )
 
-    if not isinstance(data, dict) or data.get("code") != "0":
-        raise RuntimeError(f"OKX candles error {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
 
-    rows = data.get("data", [])
-    if not isinstance(rows, list) or not rows:
-        raise RuntimeError(f"OKX candles empty {symbol}. Host={host} Status={status} Data={str(data)[:200]}")
-
-    parsed = []
-    for r in rows:
-        if not isinstance(r, list) or len(r) < 6:
-            continue
-        parsed.append(r)
-
-    df = pd.DataFrame(
-        parsed,
-        columns=[
-            "start_ms", "open", "high", "low", "close", "volume",
-            "volCcy", "volCcyQuote", "confirm"
-        ][:len(parsed[0])]
-    )
-
-    df["start_ms"] = pd.to_numeric(df["start_ms"], errors="coerce")
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna().sort_values("start_ms").reset_index(drop=True)
-
-    # tz-naive
-    df["open_time"] = pd.to_datetime(df["start_ms"], unit="ms", utc=True).dt.tz_convert(None)
-    df["close_time"] = df["open_time"].apply(lambda t: _infer_close_time(t, bar))
-
-    cols = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
-    if "confirm" in df.columns:
-        cols.append("confirm")
-    return df[cols]
-
-# =========================
-# Indicators / Strategy
-# =========================
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def macd(close: pd.Series, fast: int, slow: int, sig: int):
-    macd_line = ema(close, fast) - ema(close, slow)
-    signal_line = ema(macd_line, sig)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def compute_pivots(df: pd.DataFrame, n: int):
-    highs = df["high"].values
-    lows = df["low"].values
-    ph = [math.nan] * len(df)
-    pl = [math.nan] * len(df)
-
-    for i in range(n, len(df) - n):
-        window_h = highs[i - n:i + n + 1]
-        window_l = lows[i - n:i + n + 1]
-        if highs[i] == max(window_h):
-            ph[i] = highs[i]
-        if lows[i] == min(window_l):
-            pl[i] = lows[i]
-
-    return pd.Series(ph), pd.Series(pl)
-
-
-def evaluate_signals(df: pd.DataFrame):
-    if len(df) < max(SMA_LEN + 10, 300):
-        return None
-
-    df = df.copy()
-
-    df["sma200"] = df["close"].rolling(SMA_LEN).mean()
-
-    macd_line, signal_line, hist = macd(df["close"], MACD_FAST, MACD_SLOW, MACD_SIG)
-    df["macd"] = macd_line
-    df["signal"] = signal_line
-    df["hist"] = hist
-
-    df["macdBull"] = (df["macd"] > df["signal"]) & (df["hist"] > 0)
-    df["macdBear"] = (df["macd"] < df["signal"]) & (df["hist"] < 0)
-
-    df["trendBull"] = df["close"] > df["sma200"]
-    df["trendBear"] = df["close"] < df["sma200"]
-
-    ph, pl = compute_pivots(df, PIVOT_LEN)
-    df["ph"] = ph
-    df["pl"] = pl
-
-    lastSwingHigh = math.nan
-    lastSwingLow = math.nan
-    structureTrend = 0
-
-    bosBull = [False] * len(df)
-    bosBear = [False] * len(df)
-    chochBull = [False] * len(df)
-    chochBear = [False] * len(df)
-    sweepBull = [False] * len(df)
-    sweepBear = [False] * len(df)
-
-    for i in range(len(df)):
-        if not math.isnan(df.at[i, "ph"]):
-            lastSwingHigh = float(df.at[i, "ph"])
-        if not math.isnan(df.at[i, "pl"]):
-            lastSwingLow = float(df.at[i, "pl"])
-
-        c = float(df.at[i, "close"])
-        lo = float(df.at[i, "low"])
-        hi = float(df.at[i, "high"])
-
-        bBull = (not math.isnan(lastSwingHigh)) and (c > lastSwingHigh)
-        bBear = (not math.isnan(lastSwingLow)) and (c < lastSwingLow)
-
-        cBull = (structureTrend == -1) and bBull
-        cBear = (structureTrend == 1) and bBear
-
-        bosBull[i] = bBull
-        bosBear[i] = bBear
-        chochBull[i] = cBull
-        chochBear[i] = cBear
-
-        if bBull:
-            structureTrend = 1
-        if bBear:
-            structureTrend = -1
-
-        if not math.isnan(lastSwingLow):
-            sweepBull[i] = (lo < lastSwingLow) and (c > lastSwingLow)
-        if not math.isnan(lastSwingHigh):
-            sweepBear[i] = (hi > lastSwingHigh) and (c < lastSwingHigh)
-
-    df["smcBullEvent"] = (pd.Series(bosBull) | pd.Series(chochBull))
-    df["smcBearEvent"] = (pd.Series(bosBear) | pd.Series(chochBear))
-
-    if USE_SWEEP:
-        df["buySignal"] = df["trendBull"] & df["macdBull"] & df["smcBullEvent"] & pd.Series(sweepBull)
-    else:
-        df["buySignal"] = df["trendBull"] & df["macdBull"] & df["smcBullEvent"]
-
-    df["buyTrigger"] = df["buySignal"] & (~df["buySignal"].shift(1).fillna(False))
-
-    # ===== Volume spike (Pump potential) =====
-    df["volMA"] = df["volume"].rolling(VOL_MA_LEN).mean()
-    df["volRatio"] = df["volume"] / df["volMA"]
-
-    # ===== Choose last confirmed candle =====
-    if "confirm" in df.columns:
-        confirmed_idx = df.index[df["confirm"].astype(str) == "1"]
-        if len(confirmed_idx) == 0:
-            return None
-        idx = int(confirmed_idx[-1])
-    else:
-        idx = len(df) - 2
-
-    if idx < 0:
-        return None
-
-    # ===== Recent-close filter (no duplicates) =====
-    now = pd.Timestamp.utcnow().tz_localize(None)
-    ct = pd.to_datetime(df.at[idx, "close_time"], errors="coerce")
-    if pd.isna(ct):
-        return None
-
-    ct = pd.Timestamp(ct).tz_localize(None)
-    age_sec = abs((now - ct).total_seconds())
-    is_recent_close = age_sec <= RECENT_WINDOW_SEC
-
-    buy_now = bool(df.at[idx, "buyTrigger"]) and is_recent_close
-
-    # Pump potential if buy + big volume spike
-    vol_ratio = df.at[idx, "volRatio"]
-    try:
-        vol_ratio_f = float(vol_ratio)
-    except Exception:
-        vol_ratio_f = float("nan")
-
-    pump = False
-    if buy_now and (not math.isnan(vol_ratio_f)) and vol_ratio_f >= VOL_SPIKE_MULT:
-        pump = True
-
-    return {
-        "buy": buy_now,
-        "pump": pump,
-        "vol_ratio": vol_ratio_f,
-        "price": float(df.at[idx, "close"]),
-        "time": str(df.at[idx, "close_time"]),
-    }
-
-# =========================
-# Main
-# =========================
 def main():
-    try:
-        symbols = get_top_usdt_symbols(TOP_N)
-    except Exception as e:
-        err = f"❌ OKX API blocked from runner.\n{e}"
-        print(err)
-        tg_send(err)
-        return
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not bot_token or not chat_id:
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars")
 
-    alerts = []
-    print(f"Scanning {len(symbols)} symbols on {TIMEFRAME} (OKX) ...")
-    print(
-        f"Recent-window (sec): {RECENT_WINDOW_SEC} | "
-        f"VOL_MA_LEN={VOL_MA_LEN} | VOL_SPIKE_MULT={VOL_SPIKE_MULT}"
-    )
+    symbols_raw = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").strip()
+    timeframe = os.getenv("TIMEFRAME", "1h").strip()
+    limit = int(os.getenv("LIMIT", "500"))
+
+    multiplier = float(os.getenv("MULTIPLIER", "2"))
+    atr_len = int(os.getenv("ATR_LEN", "14"))
+    atr_method = os.getenv("ATR_METHOD", "Method 1").strip()  # "Method 1" or "Method 2"
+    stoploss_pct = float(os.getenv("STOPLOSS_PCT", "2.0"))
+
+    symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+
+    state = load_state()
+    sent = state.get("sent", {})
 
     for sym in symbols:
         try:
-            df = fetch_klines(sym, TIMEFRAME, limit=300)
-            sig = evaluate_signals(df)
-            if not sig:
+            df = fetch_klines(sym, timeframe, limit=limit)
+            sig = compute_signals(
+                df=df, symbol=sym, timeframe=timeframe,
+                multiplier=multiplier, atr_len=atr_len,
+                atr_method=atr_method, stoploss_pct=stoploss_pct,
+            )
+            if sig is None:
                 continue
 
-            # ✅ BUY ONLY
-            if sig["buy"]:
-                if sig["pump"]:
-                    alerts.append(
-                        f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}\n"
-                        f"🚀 PUMP محتمل | Volume Spike x{sig['vol_ratio']:.2f} (>= {VOL_SPIKE_MULT})"
-                    )
-                else:
-                    alerts.append(
-                        f"🟢 BUY | {sym} | TF {TIMEFRAME} | Price {sig['price']:.8g} | Close {sig['time']}"
-                    )
+            key = make_key(sig)
+            if sent.get(key):
+                continue  # already sent this exact signal
+
+            msg = format_message(sig)
+            tg_send(bot_token, chat_id, msg)
+
+            sent[key] = int(time.time())
+            state["sent"] = sent
+            save_state(state)
 
         except Exception as e:
-            print(f"{sym} error: {e}")
+            # لا نوقف السكربت بالكامل بسبب رمز واحد
+            err_msg = f"[ERROR] {sym} {timeframe}: {type(e).__name__}: {e}"
+            print(err_msg)
 
-        time.sleep(0.25)
-
-    if alerts:
-        msg = f"📡 BUY Alerts Only (OKX) | TF {TIMEFRAME}\n" + "\n\n".join(alerts[:20])
-        tg_send(msg)
-        print("Sent BUY alerts:", len(alerts))
-    else:
-        print("No alerts.")
+    print("Done")
 
 
 if __name__ == "__main__":
