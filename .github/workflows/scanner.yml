@@ -1,4 +1,4 @@
-name: Binance Strategy Scanner
+name: Binance Strategy Scanner (15m)
 
 on:
   workflow_dispatch:
@@ -8,8 +8,9 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -17,15 +18,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 🔎 تشخيص سريع (لن يظهر التوكن)
+      - name: Debug secrets presence
+        run: |
+          if [ -z "${{ secrets.BOT_TOKEN }}" ]; then echo "BOT_TOKEN: EMPTY"; else echo "BOT_TOKEN: SET"; fi
+          if [ -z "${{ secrets.CHAT_ID }}" ]; then echo "CHAT_ID: EMPTY"; else echo "CHAT_ID: SET"; fi
+
       - name: Run scanner
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.CHAT_ID }}
 
           SYMBOLS: ${{ vars.SYMBOLS }}
           TIMEFRAME: ${{ vars.TIMEFRAME }}
@@ -36,3 +43,4 @@ jobs:
           STOPLOSS_PCT: ${{ vars.STOPLOSS_PCT }}
         run: |
           python scanner.py
+
