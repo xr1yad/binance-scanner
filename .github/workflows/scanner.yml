@@ -3,7 +3,7 @@ name: Binance Strategy Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 * * * *"
+    - cron: "*/15 * * * *"
 
 jobs:
   run:
@@ -26,6 +26,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
           SYMBOLS: ${{ vars.SYMBOLS }}
           TIMEFRAME: ${{ vars.TIMEFRAME }}
           LIMIT: ${{ vars.LIMIT }}
